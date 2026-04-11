@@ -15,6 +15,8 @@ const _darkBg   = Color(0xFF111827); // slate-900
 const _darkCard = Color(0xFF1F2937); // slate-800
 const _darkBdr  = Color(0xFF374151); // slate-700
 
+enum _RiskFilter { all, low, moderate, high }
+
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
 
@@ -570,7 +572,7 @@ class _DrawerTile extends StatelessWidget {
 }
 
 // ─── Patients Tab ─────────────────────────────────────────────────────────────
-class _PatientsTab extends StatelessWidget {
+class _PatientsTab extends StatefulWidget {
   final DoctorService service;
   final Future<void> Function(BuildContext, String, String) onAlert;
   final bool isCompact;
@@ -578,9 +580,126 @@ class _PatientsTab extends StatelessWidget {
   const _PatientsTab({required this.service, required this.onAlert, this.isCompact = false});
 
   @override
+  State<_PatientsTab> createState() => _PatientsTabState();
+}
+
+class _PatientsTabState extends State<_PatientsTab> {
+  _RiskFilter _selectedFilter = _RiskFilter.all;
+  String _docsSignature = '';
+  Future<Map<String, int>>? _riskFuture;
+
+  String _buildDocsSignature(List<DocumentSnapshot> docs) =>
+      docs.map((d) => d.id).join('|');
+
+  void _ensureRiskFuture(List<DocumentSnapshot> docs) {
+    final signature = _buildDocsSignature(docs);
+    if (_riskFuture == null || signature != _docsSignature) {
+      _docsSignature = signature;
+      _riskFuture = _computeSevenDayRiskMap(docs);
+    }
+  }
+
+  Future<Map<String, int>> _computeSevenDayRiskMap(List<DocumentSnapshot> docs) async {
+    final Map<String, int> map = {};
+    final nowRaw = DateTime.now();
+    final now = DateTime(nowRaw.year, nowRaw.month, nowRaw.day);
+    final startDate = now.subtract(const Duration(days: 6));
+    final startStr = DateFormat('yyyy-MM-dd').format(startDate);
+    final endStr = DateFormat('yyyy-MM-dd').format(now);
+
+    for (final doc in docs) {
+      try {
+        final userData = doc.data() as Map<String, dynamic>;
+        final createdAt = userData['createdAt'] as Timestamp?;
+
+        final snap = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(doc.id)
+            .collection('daily_logs')
+            .orderBy('date', descending: false)
+            .get();
+
+        DateTime accountCreatedDate;
+        if (createdAt != null) {
+          final d = createdAt.toDate();
+          accountCreatedDate = DateTime(d.year, d.month, d.day);
+        } else if (snap.docs.isNotEmpty) {
+          final firstRealLog = snap.docs.firstWhere(
+            (d) => ((d.data()['adherence'] as num?)?.toInt() ?? 0) > 0,
+            orElse: () => snap.docs.first,
+          );
+          final firstDate = firstRealLog.data()['date'] as String?;
+          accountCreatedDate = firstDate != null
+              ? DateTime.parse(firstDate)
+              : now.subtract(const Duration(days: 6));
+        } else {
+          accountCreatedDate = now.subtract(const Duration(days: 6));
+        }
+
+        final accountStartStr = DateFormat('yyyy-MM-dd').format(accountCreatedDate);
+
+        final logs = snap.docs
+            .map((d) => d.data())
+            .where((log) {
+              final date = log['date'] as String? ?? '';
+              if (date.compareTo(accountStartStr) < 0) return false;
+              return date.compareTo(startStr) >= 0 && date.compareTo(endStr) <= 0;
+            })
+            .toList();
+
+        final effectiveStart = accountCreatedDate.isAfter(startDate)
+            ? accountCreatedDate
+            : startDate;
+        final totalDays = now.difference(effectiveStart).inDays + 1;
+
+        if (totalDays > 0) {
+          final total = logs.fold<int>(0, (s, l) => s + ((l['adherence'] as num?)?.toInt() ?? 0));
+          map[doc.id] = (total / totalDays).round().clamp(0, 100);
+        } else {
+          map[doc.id] = 0;
+        }
+      } catch (_) {
+        final data = doc.data() as Map<String, dynamic>;
+        map[doc.id] = ((data['lastAdherence'] as num?)?.toInt() ?? 0).clamp(0, 100);
+      }
+    }
+
+    return map;
+  }
+
+  bool _matchesRisk(int adherence, _RiskFilter filter) {
+    if (filter == _RiskFilter.all) return true;
+    switch (filter) {
+      case _RiskFilter.low:
+        return adherence >= 80;
+      case _RiskFilter.moderate:
+        return adherence >= 50 && adherence < 80;
+      case _RiskFilter.high:
+        return adherence < 50;
+      case _RiskFilter.all:
+        return true;
+    }
+  }
+
+  Widget _filterChip(String label, _RiskFilter value) {
+    final isSelected = _selectedFilter == value;
+    return ChoiceChip(
+      label: Text(label),
+      selected: isSelected,
+      selectedColor: _crimson.withOpacity(0.18),
+      labelStyle: TextStyle(
+        color: isSelected ? _crimson : Colors.grey,
+        fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+      ),
+      side: BorderSide(color: isSelected ? _crimson.withOpacity(0.4) : Colors.grey.withOpacity(0.25)),
+      onSelected: (_) => setState(() => _selectedFilter = value),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
     return StreamBuilder<QuerySnapshot>(
-      stream: service.getPatientsStream(),
+      stream: widget.service.getPatientsStream(),
       builder: (ctx, snap) {
         if (snap.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator(color: _crimson));
@@ -595,6 +714,7 @@ class _PatientsTab extends StatelessWidget {
 
         // Query already filtered server-side for patients only
         final docs = snap.data!.docs;
+        _ensureRiskFuture(docs);
         
         if (docs.isEmpty) {
           return _EmptyState(
@@ -604,61 +724,104 @@ class _PatientsTab extends StatelessWidget {
           );
         }
 
-        return Column(
-          children: [
-            // ── Stats bar ──────────────────────────────────────────────
-            _StatsBar(docs: docs, isCompact: isCompact),
+        return FutureBuilder<Map<String, int>>(
+          future: _riskFuture,
+          builder: (context, riskSnap) {
+            final riskMap = riskSnap.data ?? const <String, int>{};
+            final filteredDocs = docs.where((d) {
+              final adherence = riskMap[d.id] ?? 0;
+              return _matchesRisk(adherence, _selectedFilter);
+            }).toList();
 
-            // ── Patient grid ──────────────────────────────────────────
-            Expanded(
-              child: LayoutBuilder(builder: (_, constraints) {
-                final width = constraints.maxWidth;
-                final isMobile = width < 600;
-                final isNarrow = width < 400; // Fold phones
-                
-                // Calculate best card width based on screen size
-                double maxExtent;
-                double aspectRatio;
-                double spacing;
-                
-                if (isNarrow) {
-                  maxExtent = width - 32; // Full width minus padding
-                  aspectRatio = 0.72; // More height for compact
-                  spacing = 12;
-                } else if (isMobile) {
-                  maxExtent = 360;
-                  aspectRatio = 0.72;
-                  spacing = 14;
-                } else {
-                  maxExtent = 340;
-                  aspectRatio = 0.75;
-                  spacing = 16;
-                }
-                
-                return GridView.builder(
-                  padding: EdgeInsets.only(
-                    left: isMobile ? (isNarrow ? 12 : 16) : 104,
-                    right: isMobile ? (isNarrow ? 12 : 16) : 24,
-                    top: 16,
-                    bottom: 24,
+            return Column(
+              children: [
+                // ── Stats bar ──────────────────────────────────────────────
+                _StatsBar(docs: filteredDocs, isCompact: widget.isCompact),
+
+                Padding(
+                  padding: EdgeInsets.fromLTRB(widget.isCompact ? 12 : 16, 12, widget.isCompact ? 12 : 16, 0),
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: [
+                        _filterChip('All', _RiskFilter.all),
+                        const SizedBox(width: 8),
+                        _filterChip('Low Risk', _RiskFilter.low),
+                        const SizedBox(width: 8),
+                        _filterChip('Moderate Risk', _RiskFilter.moderate),
+                        const SizedBox(width: 8),
+                        _filterChip('High Risk', _RiskFilter.high),
+                      ],
+                    ),
                   ),
-                  gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-                    maxCrossAxisExtent: maxExtent,
-                    childAspectRatio: aspectRatio,
-                    crossAxisSpacing: spacing,
-                    mainAxisSpacing: spacing,
-                  ),
-                  itemCount: docs.length,
-                  itemBuilder: (_, i) => _PatientCard(
-                    key: ValueKey(docs[i].id),
-                    doc: docs[i],
-                    onAlert: onAlert,
-                    isCompact: isNarrow,
-                  ),
-                );
-              }),
-            ),
-          ],
+                ),
+
+                if (riskSnap.connectionState == ConnectionState.waiting)
+                  const Expanded(
+                    child: Center(child: CircularProgressIndicator(color: _crimson)),
+                  )
+                else if (filteredDocs.isEmpty)
+                  Expanded(
+                    child: _EmptyState(
+                      icon: Icons.filter_alt_off_rounded,
+                      title: 'No Patients In This Filter',
+                      subtitle: 'Try a different risk filter.',
+                    ),
+                  )
+                else
+
+                // ── Patient grid ──────────────────────────────────────────
+                Expanded(
+                  child: LayoutBuilder(builder: (_, constraints) {
+                    final width = constraints.maxWidth;
+                    final isMobile = width < 600;
+                    final isNarrow = width < 400; // Fold phones
+                    
+                    // Calculate best card width based on screen size
+                    double maxExtent;
+                    double aspectRatio;
+                    double spacing;
+                    
+                    if (isNarrow) {
+                      maxExtent = width - 32; // Full width minus padding
+                      aspectRatio = 0.72; // More height for compact
+                      spacing = 12;
+                    } else if (isMobile) {
+                      maxExtent = 360;
+                      aspectRatio = 0.72;
+                      spacing = 14;
+                    } else {
+                      maxExtent = 340;
+                      aspectRatio = 0.75;
+                      spacing = 16;
+                    }
+                    
+                    return GridView.builder(
+                      padding: EdgeInsets.only(
+                        left: isMobile ? (isNarrow ? 12 : 16) : 104,
+                        right: isMobile ? (isNarrow ? 12 : 16) : 24,
+                        top: 16,
+                        bottom: 24,
+                      ),
+                      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: maxExtent,
+                        childAspectRatio: aspectRatio,
+                        crossAxisSpacing: spacing,
+                        mainAxisSpacing: spacing,
+                      ),
+                      itemCount: filteredDocs.length,
+                      itemBuilder: (_, i) => _PatientCard(
+                        key: ValueKey(filteredDocs[i].id),
+                        doc: filteredDocs[i],
+                        onAlert: widget.onAlert,
+                        isCompact: isNarrow,
+                      ),
+                    );
+                  }),
+                ),
+              ],
+            );
+          },
         );
       },
     );
@@ -798,33 +961,43 @@ class _StatsBarState extends State<_StatsBar> {
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final screenWidth = MediaQuery.of(context).size.width;
-    final isMobile = screenWidth < 768;
     final isNarrow = screenWidth < 400;
     final total = widget.docs.length;
 
-    return Container(
-      color: isDark ? _darkCard : Colors.white,
+    return Padding(
       padding: EdgeInsets.only(
-        left: isMobile ? (isNarrow ? 12 : 16) : 104,
-        right: isMobile ? (isNarrow ? 12 : 16) : 24,
         top: isNarrow ? 10 : 14,
         bottom: isNarrow ? 10 : 14,
       ),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          children: [
-            _StatChip(label: 'Total Patients', value: '$total', color: Colors.indigo, isCompact: isNarrow),
-            SizedBox(width: isNarrow ? 8 : 12),
-            _loading
-                ? _StatChip(label: 'High Risk', value: '...', color: Colors.red, isCompact: isNarrow)
-                : _StatChip(label: 'High Risk', value: '$_highRisk', color: Colors.red, isCompact: isNarrow),
-            SizedBox(width: isNarrow ? 8 : 12),
-            _loading
-                ? _StatChip(label: 'Avg Adherence', value: '...', color: Colors.grey, isCompact: isNarrow)
-                : _StatChip(label: 'Avg Adherence', value: '$_avgAdherence%',
-                    color: _avgAdherence >= 80 ? Colors.green : _avgAdherence >= 50 ? Colors.orange : Colors.red, isCompact: isNarrow),
-          ],
+      child: Center(
+        child: Container(
+          padding: EdgeInsets.symmetric(
+            horizontal: isNarrow ? 12 : 16,
+            vertical: isNarrow ? 8 : 10,
+          ),
+          decoration: BoxDecoration(
+            color: isDark ? _darkCard : Colors.white,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: isDark ? _darkBdr : Colors.grey.shade200),
+          ),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _StatChip(label: 'Total Patients', value: '$total', color: Colors.indigo, isCompact: isNarrow),
+                SizedBox(width: isNarrow ? 8 : 12),
+                _loading
+                    ? _StatChip(label: 'High Risk', value: '...', color: Colors.red, isCompact: isNarrow)
+                    : _StatChip(label: 'High Risk', value: '$_highRisk', color: Colors.red, isCompact: isNarrow),
+                SizedBox(width: isNarrow ? 8 : 12),
+                _loading
+                    ? _StatChip(label: 'Avg Adherence', value: '...', color: Colors.grey, isCompact: isNarrow)
+                    : _StatChip(label: 'Avg Adherence', value: '$_avgAdherence%',
+                        color: _avgAdherence >= 80 ? Colors.green : _avgAdherence >= 50 ? Colors.orange : Colors.red, isCompact: isNarrow),
+              ],
+            ),
+          ),
         ),
       ),
     );
